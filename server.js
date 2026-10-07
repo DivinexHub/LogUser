@@ -50,7 +50,6 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local savedPosition = nil
 
--- บันทึกพิกัดตัวละคร
 task.spawn(function()
     while task.wait(1) do
         pcall(function()
@@ -61,7 +60,6 @@ task.spawn(function()
     end
 end)
 
--- โหลดสคริปต์ซ้ำอัตโนมัติเมื่อ Teleport ย้าย Map/Server (QueueOnTeleport)
 local function queueScript()
     local queueFunc = (syn and syn.queue_on_teleport) or queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
     if queueFunc then
@@ -71,7 +69,6 @@ local function queueScript()
     end
 end
 
--- ย้ายตำแหน่งเดิมหลังจากวาร์ปเสร็จ
 local function restorePosition()
     local joinData = LocalPlayer:GetJoinData()
     if joinData and joinData.TeleportData and joinData.TeleportData.pos then
@@ -89,12 +86,10 @@ local function restorePosition()
 end
 pcall(restorePosition)
 
--- ฟังก์ชัน Rejoin
 local isRejoining = false
 local function safeRejoin()
     if isRejoining then return end
     isRejoining = true
-
     queueScript()
 
     local teleportOptions = Instance.new("TeleportOptions")
@@ -103,7 +98,6 @@ local function safeRejoin()
         teleportOptions:SetTeleportData({ pos = c })
     end
 
-    -- สุ่มย้ายไป Server อื่นถ้าอยู่ใน Server เดิมคนเดียว
     pcall(function()
         TeleportService:Teleport(game.PlaceId, LocalPlayer, teleportOptions:GetTeleportData())
     end)
@@ -112,12 +106,22 @@ local function safeRejoin()
     pcall(function()
         TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer, nil, teleportOptions:GetTeleportData())
     end)
-    
     task.wait(3)
     isRejoining = false
 end
 
--- ดักจับกรณี Teleport ล้มเหลว ให้ลองใหม่
+local function handleTeleport(targetPlaceId, targetJobId)
+    if not targetPlaceId then return end
+    queueScript()
+    pcall(function()
+        if targetJobId and #targetJobId > 5 then
+            TeleportService:TeleportToPlaceInstance(tonumber(targetPlaceId), targetJobId, LocalPlayer)
+        else
+            TeleportService:Teleport(tonumber(targetPlaceId), LocalPlayer)
+        end
+    end)
+end
+
 TeleportService.TeleportInitFailed:Connect(function()
     isRejoining = false
     task.wait(2)
@@ -188,6 +192,10 @@ local function sendStatus(statusType, details)
                         LocalPlayer:Kick("\\n[Web Control]\\nถูกสั่ง Disconnect จากหน้าเว็บ")
                     elseif act == "rejoin" then 
                         safeRejoin()
+                    elseif string.sub(act, 1, 9) == "teleport:" then
+                        local teleData = string.sub(act, 10)
+                        local parts = string.split(teleData, "|")
+                        handleTeleport(parts[1], parts[2])
                     elseif string.sub(act, 1, 8) == "execute:" then
                         local encodedCode = string.sub(act, 9)
                         local success, codeToRun = pcall(function() return base64Decode(encodedCode) end)
@@ -204,7 +212,6 @@ local function sendStatus(statusType, details)
     end
 end
 
--- พยายาม Rejoin ล่วงหน้าหากขึ้น Error Prompt
 CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(child)
     if child.Name == "ErrorPrompt" and not manualKicked then
         pcall(safeRejoin)
@@ -282,9 +289,19 @@ app.post('/api/update', async (req, res) => {
 });
 
 app.post('/api/action', (req, res) => {
-    const { userId, action, code } = req.body;
-    const uid = String(userId);
+    const { userId, action, code, placeId, jobId, userKey } = req.body;
 
+    if (action === 'teleport_bulk') {
+        const key = (userKey || '').toLowerCase().trim();
+        activeAccounts.forEach((acc, uid) => {
+            if (acc.secretKey === key) {
+                pendingCommands.set(uid, `teleport:${placeId}|${jobId || ''}`);
+            }
+        });
+        return res.json({ success: true });
+    }
+
+    const uid = String(userId);
     if (activeAccounts.has(uid)) {
         const acc = activeAccounts.get(uid);
         if (action === 'kick') {
@@ -294,6 +311,8 @@ app.post('/api/action', (req, res) => {
             pendingCommands.set(uid, 'rejoin');
         } else if (action === 'execute') {
             pendingCommands.set(uid, `execute:${code}`);
+        } else if (action === 'teleport') {
+            pendingCommands.set(uid, `teleport:${placeId}|${jobId || ''}`);
         }
         return res.json({ success: true });
     }
@@ -318,7 +337,7 @@ app.get('/api/accounts', (req, res) => {
 });
 
 // ====================================================
-// 3. FRONTEND (LOGIN & DASHBOARD UI)
+// 3. FRONTEND (UI DASHBOARD, HAMBURGER & MAPS)
 // ====================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -327,7 +346,7 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Roblox Control Center</title>
+        <title>Roblox Control Hub</title>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
@@ -354,17 +373,66 @@ app.get('/', (req, res) => {
             .auth-btn { width: 100%; background: var(--accent); color: white; border: none; padding: 12px; border-radius: 10px; font-weight: 700; cursor: pointer; margin-bottom: 10px; }
             .auth-btn-sub { background: transparent; border: 1px solid var(--border); color: var(--text-sub); }
             
+            /* Header & Hamburger Button */
             .header-panel {
                 background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border);
                 border-radius: 20px; padding: 20px 28px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;
             }
             .brand { display: flex; align-items: center; gap: 14px; }
             .brand-icon { width: 46px; height: 46px; background: linear-gradient(135deg, var(--accent), #4f46e5); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; color: white; }
-            .user-tag { background: rgba(99, 102, 241, 0.15); border: 1px solid rgba(99, 102, 241, 0.3); color: #818cf8; padding: 6px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 700; }
-            .logout-btn { background: rgba(244, 63, 94, 0.15); color: var(--danger); border: 1px solid rgba(244, 63, 94, 0.3); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-weight: 700; font-size: 0.82rem; margin-left: 10px; }
+            
+            .hamburger-btn {
+                background: rgba(255,255,255,0.05); border: 1px solid var(--border); color: white;
+                width: 44px; height: 44px; border-radius: 12px; font-size: 1.2rem; cursor: pointer; transition: all 0.2s;
+                display: flex; align-items: center; justify-content: center;
+            }
+            .hamburger-btn:hover { background: var(--accent); }
 
-            .script-guide {
-                background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 14px; padding: 14px 20px; margin-bottom: 24px; color: #34d399; font-size: 0.85rem; font-weight: 600; display: flex; justify-content: space-between; align-items: center;
+            /* Right Drawer Sidebar */
+            .drawer-overlay {
+                position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6);
+                backdrop-filter: blur(4px); z-index: 99; opacity: 0; pointer-events: none; transition: opacity 0.3s;
+            }
+            .drawer-overlay.active { opacity: 1; pointer-events: auto; }
+            
+            .drawer-menu {
+                position: fixed; top: 0; right: -320px; width: 300px; height: 100%;
+                background: #0f172a; border-left: 1px solid var(--border); z-index: 100;
+                padding: 32px 24px; transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+                display: flex; flex-direction: column; justify-content: space-between;
+            }
+            .drawer-menu.active { right: 0; }
+            .drawer-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+            .close-btn { background: none; border: none; color: var(--text-sub); font-size: 1.3rem; cursor: pointer; }
+            .close-btn:hover { color: white; }
+
+            .nav-list { display: flex; flex-direction: column; gap: 12px; }
+            .nav-item {
+                background: rgba(255,255,255,0.03); border: 1px solid var(--border); color: var(--text-main);
+                padding: 14px 18px; border-radius: 12px; font-weight: 600; cursor: pointer;
+                display: flex; align-items: center; gap: 12px; transition: all 0.2s;
+            }
+            .nav-item:hover, .nav-item.active { background: var(--accent); border-color: var(--accent); color: white; }
+
+            /* Tab Pages */
+            .page-tab { display: none; }
+            .page-tab.active { display: block; }
+
+            /* Map Selector Form */
+            .map-box {
+                background: var(--card-bg); border: 1px solid var(--border); border-radius: 20px;
+                padding: 28px; max-width: 600px; margin: 0 auto; backdrop-filter: blur(12px);
+            }
+            .map-input-group { margin-bottom: 20px; text-align: left; }
+            .map-input-group label { display: block; font-size: 0.85rem; color: var(--text-sub); margin-bottom: 8px; font-weight: 600; }
+            .map-select, .map-input {
+                width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border);
+                border-radius: 10px; padding: 12px; color: white; font-family: inherit; outline: none;
+            }
+            .map-select:focus, .map-input:focus { border-color: var(--accent); }
+            .btn-teleport {
+                width: 100%; background: linear-gradient(135deg, var(--accent), #4f46e5); color: white;
+                border: none; padding: 14px; border-radius: 12px; font-weight: 700; cursor: pointer; font-size: 0.95rem;
             }
 
             .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 24px; }
@@ -389,7 +457,6 @@ app.get('/', (req, res) => {
 
             .exec-box { margin-bottom: 16px; }
             .exec-input { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 8px; color: #a5f3fc; padding: 10px; font-family: monospace; font-size: 0.8rem; resize: vertical; height: 70px; margin-bottom: 6px; }
-            .exec-input:focus { outline: none; border-color: var(--accent); }
             .btn-exec { width: 100%; background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); padding: 8px; border-radius: 8px; font-weight: 600; font-size: 0.8rem; cursor: pointer; transition: all 0.2s; }
             .btn-exec:hover { background: var(--accent); color: white; }
 
@@ -417,31 +484,168 @@ app.get('/', (req, res) => {
                 <div class="brand">
                     <div class="brand-icon"><i class="fa-solid fa-cubes"></i></div>
                     <div>
-                        <h1 style="font-size: 1.25rem;">Roblox Control Hub</h1>
-                        <p style="font-size: 0.8rem; color: var(--text-sub);">Remote Command Center</p>
+                        <h1 style="font-size: 1.25rem;" id="pageTitle">Dashboard</h1>
+                        <p style="font-size: 0.8rem; color: var(--text-sub);">Roblox Control Center</p>
                     </div>
                 </div>
+                <button class="hamburger-btn" onclick="toggleDrawer()"><i class="fa-solid fa-bars"></i></button>
+            </div>
+
+            <!-- Drawer Sidebar ด้านขวา -->
+            <div class="drawer-overlay" id="drawerOverlay" onclick="toggleDrawer()"></div>
+            <div class="drawer-menu" id="drawerMenu">
                 <div>
-                    <span class="user-tag"><i class="fa-solid fa-user"></i> <span id="currentUserName">User</span></span>
-                    <button class="logout-btn" onclick="logout()"><i class="fa-solid fa-right-from-bracket"></i> ออกจากระบบ</button>
+                    <div class="drawer-header">
+                        <h3 style="font-size: 1.1rem;"><i class="fa-solid fa-sliders" style="color: var(--accent);"></i> Menu</h3>
+                        <button class="close-btn" onclick="toggleDrawer()"><i class="fa-solid fa-xmark"></i></button>
+                    </div>
+                    <div class="nav-list">
+                        <div class="nav-item active" id="nav-dashboard" onclick="switchPage('dashboard')">
+                            <i class="fa-solid fa-chart-line"></i> Dashboard
+                        </div>
+                        <div class="nav-item" id="nav-map" onclick="switchPage('map')">
+                            <i class="fa-solid fa-map-location-dot"></i> Map Control
+                        </div>
+                        <div class="nav-item" id="nav-setting" onclick="switchPage('setting')">
+                            <i class="fa-solid fa-gear"></i> Settings
+                        </div>
+                    </div>
+                </div>
+                <button class="btn-act btn-kick" onclick="logout()"><i class="fa-solid fa-right-from-bracket"></i> ออกจากระบบ</button>
+            </div>
+
+            <!-- TAB 1: DASHBOARD -->
+            <div id="tab-dashboard" class="page-tab active">
+                <div class="grid" id="accountGrid">
+                    <div class="empty-state" id="emptyState">
+                        <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครกำลังออนไลน์ในบัญชีนี้
+                    </div>
                 </div>
             </div>
 
-            <div class="script-guide">
-                <span><i class="fa-solid fa-code"></i> โค้ดสำหรับวางใน Executor บนมือถือของคุณ:</span>
-                <code id="luaScriptCode" style="background: rgba(0,0,0,0.4); padding: 4px 10px; border-radius: 6px; font-family: monospace;">getgenv().SecretKey = "..." ; loadstring(...)()</code>
-            </div>
+            <!-- TAB 2: MAP CONTROL -->
+            <div id="tab-map" class="page-tab">
+                <div class="map-box">
+                    <h2 style="font-size: 1.25rem; margin-bottom: 20px; text-align: center;"><i class="fa-solid fa-compass" style="color: var(--accent);"></i> เปลี่ยนแมพให้ตัวละคร</h2>
+                    
+                    <div class="map-input-group">
+                        <label>เลือกตัวละครเป้าหมาย:</label>
+                        <select id="mapTargetUser" class="map-select">
+                            <option value="ALL">-- ทุกตัวละครที่กำลังออนไลน์ (All Accounts) --</option>
+                        </select>
+                    </div>
 
-            <div class="grid" id="accountGrid">
-                <div class="empty-state" id="emptyState">
-                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครกำลังออนไลน์ในบัญชีนี้
+                    <div class="map-input-group">
+                        <label>เลือกแมพยอดนิยม (Preset Maps):</label>
+                        <select id="mapPresetSelect" class="map-select" onchange="applyPresetMap()">
+                            <option value="">-- หรือเลือกจากรายการแมพยอดฮิต --</option>
+                            <option value="2753915549">Blox Fruits (Sea 1)</option>
+                            <option value="4442272183">Blox Fruits (Sea 2)</option>
+                            <option value="7449423635">Blox Fruits (Sea 3)</option>
+                            <option value="8737871919">Pet Simulator 99</option>
+                            <option value="4520749081">King Legacy</option>
+                            <option value="6284912304">Anime Fighters Simulator</option>
+                            <option value="4924922222">Brookhaven RP</option>
+                        </select>
+                    </div>
+
+                    <div class="map-input-group">
+                        <label>Place ID (ระบุเอง):</label>
+                        <input type="text" id="customPlaceId" class="map-input" placeholder="ตัวอย่าง: 2753915549">
+                    </div>
+
+                    <div class="map-input-group">
+                        <label>Job ID (สำหรับ Private Server / เซิร์ฟย่อย - ไม่จำเป็นต้องใส่):</label>
+                        <input type="text" id="customJobId" class="map-input" placeholder="วาง Job ID หากต้องการวาร์ปเข้าเซิร์ฟย่อยเฉพาะ">
+                    </div>
+
+                    <button class="btn-teleport" onclick="sendTeleportCommand()"><i class="fa-solid fa-paper-plane"></i> สั่งเปลี่ยนแมพทันที</button>
                 </div>
             </div>
+
+            <!-- TAB 3: SETTINGS -->
+            <div id="tab-setting" class="page-tab">
+                <div class="map-box">
+                    <h2 style="font-size: 1.25rem; margin-bottom: 20px; text-align: center;"><i class="fa-solid fa-sliders" style="color: var(--accent);"></i> ตั้งค่าบัญชีผู้ใช้</h2>
+                    
+                    <div class="map-input-group">
+                        <label>Secret Key ประจำบัญชีของคุณ:</label>
+                        <input type="text" id="settingSecretKey" class="map-input" readonly>
+                    </div>
+
+                    <div class="map-input-group">
+                        <label>สคริปต์สำหรับวางใน Executor บนมือถือ:</label>
+                        <textarea id="settingScriptText" class="exec-input" style="height: 90px;" readonly></textarea>
+                    </div>
+
+                    <button class="btn-exec" onclick="copyScriptCode()"><i class="fa-solid fa-copy"></i> คัดลอกสคริปต์</button>
+                </div>
+            </div>
+
         </div>
 
         <script>
             let isRegisterMode = false;
             let loggedInUserKey = localStorage.getItem('app_user_key');
+
+            function toggleDrawer() {
+                document.getElementById('drawerOverlay').classList.toggle('active');
+                document.getElementById('drawerMenu').classList.toggle('active');
+            }
+
+            function switchPage(pageName) {
+                document.querySelectorAll('.page-tab').forEach(el => el.classList.remove('active'));
+                document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+
+                document.getElementById('tab-' + pageName).classList.add('active');
+                document.getElementById('nav-' + pageName).classList.add('active');
+
+                const titleMap = {
+                    dashboard: 'Dashboard',
+                    map: 'Map Control',
+                    setting: 'Settings'
+                };
+                document.getElementById('pageTitle').innerText = titleMap[pageName] || 'Dashboard';
+                toggleDrawer();
+            }
+
+            function applyPresetMap() {
+                const presetVal = document.getElementById('mapPresetSelect').value;
+                if(presetVal) {
+                    document.getElementById('customPlaceId').value = presetVal;
+                }
+            }
+
+            async function sendTeleportCommand() {
+                const placeId = document.getElementById('customPlaceId').value.trim();
+                const jobId = document.getElementById('customJobId').value.trim();
+                const targetUser = document.getElementById('mapTargetUser').value;
+
+                if (!placeId) return alert('กรุณาระบุ Place ID แมพที่ต้องการเปลี่ยน');
+
+                try {
+                    if (targetUser === 'ALL') {
+                        await fetch('/api/action', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ action: 'teleport_bulk', placeId, jobId, userKey: loggedInUserKey })
+                        });
+                    } else {
+                        await fetch('/api/action', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ userId: targetUser, action: 'teleport', placeId, jobId })
+                        });
+                    }
+                    alert('ส่งคำสั่งย้ายแมพเรียบร้อย!');
+                } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
+            }
+
+            function copyScriptCode() {
+                const text = document.getElementById('settingScriptText').value;
+                navigator.clipboard.writeText(text);
+                alert('คัดลอกสคริปต์เรียบร้อย!');
+            }
 
             function toggleAuthMode() {
                 isRegisterMode = !isRegisterMode;
@@ -480,14 +684,18 @@ app.get('/', (req, res) => {
                 localStorage.removeItem('app_user_key');
                 loggedInUserKey = null;
                 checkLoginState();
+                if(document.getElementById('drawerMenu').classList.contains('active')) toggleDrawer();
             }
 
             function checkLoginState() {
                 if(loggedInUserKey) {
                     document.getElementById('authPanel').style.display = 'none';
                     document.getElementById('dashPanel').style.display = 'block';
-                    document.getElementById('currentUserName').innerText = loggedInUserKey;
-                    document.getElementById('luaScriptCode').innerText = \`getgenv().SecretKey = "\${loggedInUserKey}"\\nloadstring(game:HttpGet("https://loguser.onrender.com/script.lua"))()\`;
+                    
+                    const scriptCode = \`getgenv().SecretKey = "\${loggedInUserKey}"\\nloadstring(game:HttpGet("https://loguser.onrender.com/script.lua"))()\`;
+                    document.getElementById('settingSecretKey').value = loggedInUserKey;
+                    document.getElementById('settingScriptText').value = scriptCode;
+                    
                     fetchAccounts();
                 } else {
                     document.getElementById('authPanel').style.display = 'block';
@@ -520,7 +728,7 @@ app.get('/', (req, res) => {
                     else if(action === 'execute') {
                         alert('ส่งโค้ดเรียบร้อยแล้ว!');
                         document.getElementById('code-' + userId).value = '';
-                    } else alert('ส่งคำสั่ง Rejoin เรียบร้อย!');
+                    } else alert('ส่งคำสั่งเรียบร้อย!');
                 } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
             }
 
@@ -537,7 +745,16 @@ app.get('/', (req, res) => {
                     const data = await res.json();
                     const container = document.getElementById('accountGrid');
                     const emptyState = document.getElementById('emptyState');
+                    const targetSelect = document.getElementById('mapTargetUser');
                     
+                    // อัปเดตตัวเลือกไอดีในหน้า Map
+                    targetSelect.innerHTML = '<option value="ALL">-- ทุกตัวละครที่กำลังออนไลน์ (All Accounts) --</option>';
+                    data.forEach(acc => {
+                        if(acc.status === 'Active') {
+                            targetSelect.innerHTML += \`<option value="\${acc.userId}">\${acc.displayName} (@\${acc.username})</option>\`;
+                        }
+                    });
+
                     if(data.length === 0) {
                         if(emptyState) emptyState.style.display = 'block';
                         document.querySelectorAll('.card').forEach(card => card.remove());
