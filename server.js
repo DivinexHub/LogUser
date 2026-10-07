@@ -58,7 +58,6 @@ local function getExecutorName()
     return (identifyexecutor and identifyexecutor()) or (getexecutorname and getexecutorname()) or "Unknown Executor"
 end
 
--- Base64 Decoder ที่เสถียรสำหรับ Luau
 local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local function base64Decode(data)
     data = string.gsub(data, '[^'..b..'=]', '')
@@ -116,14 +115,8 @@ local function sendStatus(statusType, details)
                         if success and codeToRun then
                             task.spawn(function()
                                 local func, err = loadstring(codeToRun)
-                                if func then 
-                                    func() 
-                                else 
-                                    warn("[Exec Error]: " .. tostring(err)) 
-                                end
+                                if func then func() else warn("[Exec Error]: " .. tostring(err)) end
                             end)
-                        else
-                            warn("[Exec Error]: Decode Failed")
                         end
                     end
                 end
@@ -162,7 +155,7 @@ sendStatus("Online", "Connected")
 // 2. API ENDPOINTS
 // ====================================================
 app.post('/api/update', async (req, res) => {
-    const { userId, username, displayName, placeId, jobId, gameName, executor, status, details } = req.body;
+    const { userId, username, displayName, placeId, jobId, gameName, executor } = req.body;
     if (!userId) return res.status(400).json({ error: 'Invalid Data' });
 
     const uid = String(userId);
@@ -179,8 +172,7 @@ app.post('/api/update', async (req, res) => {
         jobId: jobId || '',
         gameName: gameName || `Place ID: ${placeId}`,
         executor: executor || 'Unknown',
-        status: status || 'Online',
-        details: details || 'Active',
+        status: 'Active',
         avatarUrl: avatarUrl || 'https://tr.rbxcdn.com/30day-avatar-headshot',
         lastSeen: Date.now()
     });
@@ -196,9 +188,10 @@ app.post('/api/action', (req, res) => {
     const uid = String(userId);
 
     if (activeAccounts.has(uid)) {
+        const acc = activeAccounts.get(uid);
         if (action === 'kick') {
             pendingCommands.set(uid, 'kick');
-            activeAccounts.delete(uid);
+            acc.status = 'Disconnected'; // ปรับสถานะเป็น Disconnected แทนการลบ
         } else if (action === 'rejoin') {
             pendingCommands.set(uid, 'rejoin');
         } else if (action === 'execute') {
@@ -212,13 +205,15 @@ app.post('/api/action', (req, res) => {
 app.get('/api/accounts', (req, res) => {
     const now = Date.now();
     const result = [];
-    activeAccounts.forEach((acc, uid) => {
-        if (now - acc.lastSeen > 12000) {
-            activeAccounts.delete(uid);
-        } else {
-            result.push(acc);
+    
+    activeAccounts.forEach((acc) => {
+        // ถ้าไม่ได้ถูก Kick แต่หายไปเกิน 12 วินาที ให้ขึ้นว่า Not in Game
+        if (acc.status !== 'Disconnected' && (now - acc.lastSeen > 12000)) {
+            acc.status = 'Not in Game';
         }
+        result.push(acc);
     });
+    
     res.json(result);
 });
 
@@ -260,10 +255,17 @@ app.get('/', (req, res) => {
             .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border); border-radius: 20px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; position: relative; overflow: hidden; }
             .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, var(--accent), var(--success)); }
             
-            .user-profile { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
-            .avatar { width: 58px; height: 58px; border-radius: 16px; object-fit: cover; border: 2px solid var(--border); background: #020617; }
+            .user-profile { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+            .user-info { display: flex; align-items: center; gap: 14px; }
+            .avatar { width: 56px; height: 56px; border-radius: 16px; object-fit: cover; border: 2px solid var(--border); background: #020617; }
             .user-meta h3 { font-size: 1.05rem; font-weight: 700; }
             .user-meta p { font-size: 0.8rem; color: var(--text-sub); }
+
+            /* Status Badge Style */
+            .status-tag { padding: 4px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+            .status-tag.active { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+            .status-tag.disconnected { background: rgba(244, 63, 94, 0.15); color: #f87171; border: 1px solid rgba(244, 63, 94, 0.3); }
+            .status-tag.notingame { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
 
             .info-grid { background: rgba(2, 6, 23, 0.5); border: 1px solid var(--border); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 0.82rem; margin-bottom: 16px; }
             .info-item { display: flex; justify-content: space-between; }
@@ -298,19 +300,18 @@ app.get('/', (req, res) => {
                 </div>
                 <div class="stats-badge">
                     <i class="fa-solid fa-signal"></i>
-                    <span id="accountCount">0 Active</span>
+                    <span id="accountCount">0 Accounts</span>
                 </div>
             </div>
 
             <div class="grid" id="accountGrid">
                 <div class="empty-state" id="emptyState">
-                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครออนไลน์อยู่
+                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีข้อมูลตัวละครในระบบ
                 </div>
             </div>
         </div>
 
         <script>
-            // แปลงข้อความและโค้ด Luau เป็น Base64 แบบปลอดภัย
             function encodeBase64Safe(str) {
                 return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) {
                     return String.fromCharCode('0x' + p1);
@@ -343,6 +344,12 @@ app.get('/', (req, res) => {
                 } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
             }
 
+            function getStatusBadge(status) {
+                if (status === 'Active') return '<span class="status-tag active"><i class="fa-solid fa-circle"></i> Active</span>';
+                if (status === 'Disconnected') return '<span class="status-tag disconnected"><i class="fa-solid fa-ban"></i> Disconnected</span>';
+                return '<span class="status-tag notingame"><i class="fa-solid fa-plug-circle-xmark"></i> Not in Game</span>';
+            }
+
             async function fetchAccounts() {
                 try {
                     const res = await fetch('/api/accounts');
@@ -350,7 +357,8 @@ app.get('/', (req, res) => {
                     const container = document.getElementById('accountGrid');
                     const emptyState = document.getElementById('emptyState');
                     
-                    document.getElementById('accountCount').innerText = \`\${data.length} Active\`;
+                    const activeCount = data.filter(a => a.status === 'Active').length;
+                    document.getElementById('accountCount').innerText = \`\${activeCount} Active / \${data.length} Total\`;
                     
                     if(data.length === 0) {
                         if(emptyState) emptyState.style.display = 'block';
@@ -367,11 +375,14 @@ app.get('/', (req, res) => {
                             <div class="card" id="card-\${acc.userId}">
                                 <div>
                                     <div class="user-profile">
-                                        <img src="\${acc.avatarUrl}" class="avatar">
-                                        <div class="user-meta">
-                                            <h3>\${acc.displayName}</h3>
-                                            <p>@\${acc.username}</p>
+                                        <div class="user-info">
+                                            <img src="\${acc.avatarUrl}" class="avatar">
+                                            <div class="user-meta">
+                                                <h3>\${acc.displayName}</h3>
+                                                <p>@\${acc.username}</p>
+                                            </div>
                                         </div>
+                                        <div id="status-\${acc.userId}">\${getStatusBadge(acc.status)}</div>
                                     </div>
                                     <div class="info-grid">
                                         <div class="info-item"><span class="info-label">Map:</span><span class="info-value" id="map-\${acc.userId}" style="color:#38bdf8;">\${acc.gameName}</span></div>
@@ -392,15 +403,11 @@ app.get('/', (req, res) => {
                             \`;
                             container.insertAdjacentHTML('beforeend', newCardHtml);
                         } else {
+                            // อัปเดตข้อมูลและสถานะของการ์ดแบบสดๆ โดยไม่ลบการ์ด
                             document.getElementById('map-' + acc.userId).innerText = acc.gameName;
                             document.getElementById('exec-' + acc.userId).innerText = acc.executor;
+                            document.getElementById('status-' + acc.userId).innerHTML = getStatusBadge(acc.status);
                         }
-                    });
-
-                    const activeUids = data.map(a => String(a.userId));
-                    document.querySelectorAll('.card').forEach(card => {
-                        const uid = card.id.replace('card-', '');
-                        if (!activeUids.includes(uid)) card.remove();
                     });
 
                 } catch(e) { console.error(e); }
