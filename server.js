@@ -2,7 +2,7 @@ const express = require('express');
 const https = require('https');
 const app = express();
 
-app.use(express.json({ limit: '10mb' })); // รองรับโค้ดขนาดใหญ่
+app.use(express.json({ limit: '10mb' }));
 
 const activeAccounts = new Map();
 const pendingCommands = new Map();
@@ -26,7 +26,7 @@ function fetchRobloxAvatar(userId) {
 }
 
 // ====================================================
-// 1. ENDPOINT สำหรับ LOADSTRING
+// 1. ENDPOINT สำหรับ LOADSTRING (/script.lua)
 // ====================================================
 app.get('/script.lua', (req, res) => {
     res.setHeader('Content-Type', 'text/plain');
@@ -58,18 +58,18 @@ local function getExecutorName()
     return (identifyexecutor and identifyexecutor()) or (getexecutorname and getexecutorname()) or "Unknown Executor"
 end
 
--- ฟังก์ชัน Decode Base64 สำหรับ Luau
-local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+-- Base64 Decoder ที่เสถียรสำหรับ Luau
+local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local function base64Decode(data)
     data = string.gsub(data, '[^'..b..'=]', '')
     return (data:gsub('.', function(x)
         if (x == '=') then return '' end
-        local r,f='',(b:find(x)-1)
-        for i=6,1,-1 do r=r..(f%2^i - f%2^(i-1) >= 1 and '1' or '0') end
+        local r, f = '', (b:find(x) - 1)
+        for i = 6, 1, -1 do r = r .. (f % 2^i - f % 2^(i-1) >= 1 and '1' or '0') end
         return r;
     end):gsub('%d%d%d%d%d%d%d%d', function(x)
-        local c=0
-        for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+        local c = 0
+        for i = 1, 8 do c = c + (x:sub(i, i) == '1' and 2^(8-i) or 0) end
         return string.char(c)
     end))
 end
@@ -112,15 +112,19 @@ local function sendStatus(statusType, details)
                         TeleportService:Teleport(game.PlaceId, LocalPlayer)
                     elseif string.sub(act, 1, 8) == "execute:" then
                         local encodedCode = string.sub(act, 9)
-                        local codeToRun = base64Decode(encodedCode)
-                        task.spawn(function()
-                            local func, err = loadstring(codeToRun)
-                            if func then 
-                                func() 
-                            else 
-                                warn("[Exec Error]: " .. tostring(err)) 
-                            end
-                        end)
+                        local success, codeToRun = pcall(function() return base64Decode(encodedCode) end)
+                        if success and codeToRun then
+                            task.spawn(function()
+                                local func, err = loadstring(codeToRun)
+                                if func then 
+                                    func() 
+                                else 
+                                    warn("[Exec Error]: " .. tostring(err)) 
+                                end
+                            end)
+                        else
+                            warn("[Exec Error]: Decode Failed")
+                        end
                     end
                 end
             end
@@ -155,7 +159,7 @@ sendStatus("Online", "Connected")
 });
 
 // ====================================================
-// 2. API สื่อสาร
+// 2. API ENDPOINTS
 // ====================================================
 app.post('/api/update', async (req, res) => {
     const { userId, username, displayName, placeId, jobId, gameName, executor, status, details } = req.body;
@@ -198,7 +202,6 @@ app.post('/api/action', (req, res) => {
         } else if (action === 'rejoin') {
             pendingCommands.set(uid, 'rejoin');
         } else if (action === 'execute') {
-            // โค้ดถูกส่งมาแบบ Base64
             pendingCommands.set(uid, `execute:${code}`);
         }
         return res.json({ success: true });
@@ -220,7 +223,7 @@ app.get('/api/accounts', (req, res) => {
 });
 
 // ====================================================
-// 3. FRONTEND DASHBOARD (แก้ปัญหาช่องพิมพ์โดนลบ)
+// 3. FRONTEND DASHBOARD
 // ====================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -300,14 +303,18 @@ app.get('/', (req, res) => {
             </div>
 
             <div class="grid" id="accountGrid">
-                <div class="empty-state">กำลังเชื่อมต่อ...</div>
+                <div class="empty-state" id="emptyState">
+                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครออนไลน์อยู่
+                </div>
             </div>
         </div>
 
         <script>
-            // แปลง Unicode เป็น Base64 ป้องกันปัญหาตัวอักษรพิเศษ/ภาษาไทย/หลายบรรทัด
-            function utf8_to_b64(str) {
-                return window.btoa(unescape(encodeURIComponent(str)));
+            // แปลงข้อความและโค้ด Luau เป็น Base64 แบบปลอดภัย
+            function encodeBase64Safe(str) {
+                return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) {
+                    return String.fromCharCode('0x' + p1);
+                }));
             }
 
             async function sendAction(userId, action) {
@@ -319,7 +326,7 @@ app.get('/', (req, res) => {
                             alert('กรุณาใส่โค้ด Luau ก่อนกดรัน');
                             return;
                         }
-                        codePayload = utf8_to_b64(inputElem.value);
+                        codePayload = encodeBase64Safe(inputElem.value);
                     }
 
                     await fetch('/api/action', {
@@ -341,17 +348,21 @@ app.get('/', (req, res) => {
                     const res = await fetch('/api/accounts');
                     const data = await res.json();
                     const container = document.getElementById('accountGrid');
+                    const emptyState = document.getElementById('emptyState');
+                    
                     document.getElementById('accountCount').innerText = \`\${data.length} Active\`;
                     
                     if(data.length === 0) {
-                        container.innerHTML = \`<div class="empty-state"><i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครออนไลน์อยู่</div>\`;
+                        if(emptyState) emptyState.style.display = 'block';
+                        document.querySelectorAll('.card').forEach(card => card.remove());
                         return;
+                    } else {
+                        if(emptyState) emptyState.style.display = 'none';
                     }
 
                     data.forEach(acc => {
                         let cardElem = document.getElementById('card-' + acc.userId);
                         if (!cardElem) {
-                            // ถ้ายังไม่มีการ์ดบัญชีนี้ ให้สร้างใหม่
                             const newCardHtml = \`
                             <div class="card" id="card-\${acc.userId}">
                                 <div>
@@ -367,7 +378,7 @@ app.get('/', (req, res) => {
                                         <div class="info-item"><span class="info-label">Executor:</span><span class="info-value" id="exec-\${acc.userId}">\${acc.executor}</span></div>
                                     </div>
                                     <div class="exec-box">
-                                        <textarea id="code-\${acc.userId}" class="exec-input" placeholder="วางโค้ด Luau ที่นี่ (รองรับโค้ดยาวๆ)..."></textarea>
+                                        <textarea id="code-\${acc.userId}" class="exec-input" placeholder="วางโค้ด Luau ที่นี่..."></textarea>
                                         <button class="btn-exec" onclick="sendAction('\${acc.userId}', 'execute')">
                                             <i class="fa-solid fa-play"></i> Run Luau Code
                                         </button>
@@ -381,13 +392,11 @@ app.get('/', (req, res) => {
                             \`;
                             container.insertAdjacentHTML('beforeend', newCardHtml);
                         } else {
-                            // ถ้ามีการ์ดอยู่แล้ว ให้อัปเดตเฉพาะข้อความธรรมดา (ไม่แตะช่อง textarea)
                             document.getElementById('map-' + acc.userId).innerText = acc.gameName;
                             document.getElementById('exec-' + acc.userId).innerText = acc.executor;
                         }
                     });
 
-                    // ลบการ์ดของคนที่ออฟไลน์ออก
                     const activeUids = data.map(a => String(a.userId));
                     document.querySelectorAll('.card').forEach(card => {
                         const uid = card.id.replace('card-', '');
