@@ -5,8 +5,7 @@ const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
-// Database ในความจำระบบ (Database จำลอง)
-const users = new Map(); // { username: { passwordHash, secretKey } }
+const users = new Map();
 const activeAccounts = new Map();
 const pendingCommands = new Map();
 
@@ -38,7 +37,9 @@ function fetchRobloxAvatar(userId) {
 app.get('/script.lua', (req, res) => {
     res.setHeader('Content-Type', 'text/plain');
     res.send(`
-local SECRET_KEY = getgenv().SecretKey or "default_user"
+local RawKey = getgenv().SecretKey or "default_user"
+local SECRET_KEY = string.lower(tostring(RawKey))
+
 local SERVER_URL = "https://loguser.onrender.com/api/update"
 local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
@@ -49,6 +50,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local savedPosition = nil
 
+-- บันทึกพิกัดทุกๆ 1 วินาที
 task.spawn(function()
     while task.wait(1) do
         pcall(function()
@@ -59,6 +61,7 @@ task.spawn(function()
     end
 end)
 
+-- คืนค่าพิกัดเดิมเมื่อย้ายเซิร์ฟเวอร์สำเร็จ
 local function restorePosition()
     local joinData = LocalPlayer:GetJoinData()
     if joinData and joinData.TeleportData and joinData.TeleportData.pos then
@@ -76,14 +79,29 @@ local function restorePosition()
 end
 pcall(restorePosition)
 
+-- ฟังก์ชัน Rejoin แบบแก้ไข
+local isRejoining = false
 local function safeRejoin()
+    if isRejoining then return end
+    isRejoining = true
+
     local teleportOptions = Instance.new("TeleportOptions")
     if savedPosition then
         local c = {savedPosition:GetComponents()}
         teleportOptions:SetTeleportData({ pos = c })
     end
+
     pcall(function()
-        TeleportService:TeleportAsync(game.PlaceId, {LocalPlayer}, teleportOptions)
+        if #Players:GetPlayers() <= 1 then
+            TeleportService:Teleport(game.PlaceId, LocalPlayer, teleportOptions:GetTeleportData())
+        else
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer, nil, teleportOptions:GetTeleportData())
+        end
+    end)
+
+    task.wait(4)
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, LocalPlayer, teleportOptions:GetTeleportData())
     end)
 end
 
@@ -149,7 +167,8 @@ local function sendStatus(statusType, details)
                     if act == "kick" then
                         manualKicked = true
                         LocalPlayer:Kick("\\n[Web Control]\\nถูกสั่ง Disconnect จากหน้าเว็บ")
-                    elseif act == "rejoin" then safeRejoin()
+                    elseif act == "rejoin" then 
+                        safeRejoin()
                     elseif string.sub(act, 1, 8) == "execute:" then
                         local encodedCode = string.sub(act, 9)
                         local success, codeToRun = pcall(function() return base64Decode(encodedCode) end)
@@ -166,18 +185,17 @@ local function sendStatus(statusType, details)
     end
 end
 
-local isRejoining = false
+-- ตรวจจับ Error Prompt เพื่อ Auto Rejoin
 CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(child)
-    if child.Name == "ErrorPrompt" and not manualKicked and not isRejoining then
-        isRejoining = true
-        task.wait(2)
+    if child.Name == "ErrorPrompt" and not manualKicked then
+        task.wait(1)
         safeRejoin()
     end
 end)
 
 task.spawn(function()
     while task.wait(3) do
-        if not isRejoining and not manualKicked then sendStatus("Online", "Active") end
+        if not manualKicked then sendStatus("Online", "Active") end
     end
 end)
 sendStatus("Online", "Connected")
@@ -308,7 +326,6 @@ app.get('/', (req, res) => {
             }
             .container { max-width: 1320px; margin: 0 auto; }
             
-            /* Login Box */
             .auth-box {
                 max-width: 400px; margin: 80px auto; background: var(--card-bg); border: 1px solid var(--border);
                 border-radius: 20px; padding: 32px; backdrop-filter: blur(12px); text-align: center;
@@ -319,7 +336,6 @@ app.get('/', (req, res) => {
             .auth-btn { width: 100%; background: var(--accent); color: white; border: none; padding: 12px; border-radius: 10px; font-weight: 700; cursor: pointer; margin-bottom: 10px; }
             .auth-btn-sub { background: transparent; border: 1px solid var(--border); color: var(--text-sub); }
             
-            /* Dashboard UI */
             .header-panel {
                 background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border);
                 border-radius: 20px; padding: 20px 28px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;
@@ -370,7 +386,6 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <!-- หน้าเข้าสู่ระบบ / สมัครสมาชิก -->
         <div id="authPanel" class="auth-box">
             <h2 id="authTitle"><i class="fa-solid fa-user-shield" style="color: var(--accent);"></i> เข้าสู่ระบบ</h2>
             <input type="text" id="username" class="auth-input" placeholder="ชื่อผู้ใช้ (Username)">
@@ -379,7 +394,6 @@ app.get('/', (req, res) => {
             <button class="auth-btn auth-btn-sub" onclick="toggleAuthMode()"><span id="subBtnText">ยังไม่มีบัญชี? สมัครสมาชิก</span></button>
         </div>
 
-        <!-- หน้า Dashboard หลัก -->
         <div id="dashPanel" class="container" style="display: none;">
             <div class="header-panel">
                 <div class="brand">
