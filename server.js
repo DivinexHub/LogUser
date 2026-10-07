@@ -2,12 +2,11 @@ const express = require('express');
 const https = require('https');
 const app = express();
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // รองรับโค้ดขนาดใหญ่
 
 const activeAccounts = new Map();
-const pendingCommands = new Map(); // เก็บคำสั่ง เช่น "kick", "rejoin", หรือ "execute:<code_base64>"
+const pendingCommands = new Map();
 
-// Helper ดึงรูป Avatar
 function fetchRobloxAvatar(userId) {
     return new Promise((resolve) => {
         const url = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`;
@@ -27,7 +26,7 @@ function fetchRobloxAvatar(userId) {
 }
 
 // ====================================================
-// 1. ENDPOINT สำหรับ LOADSTRING (แจกโค้ด Luau ล่าสุด)
+// 1. ENDPOINT สำหรับ LOADSTRING
 // ====================================================
 app.get('/script.lua', (req, res) => {
     res.setHeader('Content-Type', 'text/plain');
@@ -57,6 +56,22 @@ end)
 
 local function getExecutorName()
     return (identifyexecutor and identifyexecutor()) or (getexecutorname and getexecutorname()) or "Unknown Executor"
+end
+
+-- ฟังก์ชัน Decode Base64 สำหรับ Luau
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local function base64Decode(data)
+    data = string.gsub(data, '[^'..b..'=]', '')
+    return (data:gsub('.', function(x)
+        if (x == '=') then return '' end
+        local r,f='',(b:find(x)-1)
+        for i=6,1,-1 do r=r..(f%2^i - f%2^(i-1) >= 1 and '1' or '0') end
+        return r;
+    end):gsub('%d%d%d%d%d%d%d%d', function(x)
+        local c=0
+        for i=1,8 do c=c+(x:sub(i,i)=='1' and 2^(8-i) or 0) end
+        return string.char(c)
+    end))
 end
 
 local manualKicked = false
@@ -96,10 +111,15 @@ local function sendStatus(statusType, details)
                     elseif act == "rejoin" then
                         TeleportService:Teleport(game.PlaceId, LocalPlayer)
                     elseif string.sub(act, 1, 8) == "execute:" then
-                        local codeToRun = string.sub(act, 9)
+                        local encodedCode = string.sub(act, 9)
+                        local codeToRun = base64Decode(encodedCode)
                         task.spawn(function()
                             local func, err = loadstring(codeToRun)
-                            if func then func() else warn("Exec Error: " .. tostring(err)) end
+                            if func then 
+                                func() 
+                            else 
+                                warn("[Exec Error]: " .. tostring(err)) 
+                            end
                         end)
                     end
                 end
@@ -108,7 +128,6 @@ local function sendStatus(statusType, details)
     end
 end
 
--- Auto Rejoin ระบบหลุดปกติ
 local isRejoining = false
 local function handleAutoRejoin(reason)
     if isRejoining or manualKicked then return end
@@ -136,7 +155,7 @@ sendStatus("Online", "Connected")
 });
 
 // ====================================================
-// 2. API สื่อสารกับ EXECUTOR & DASHBOARD
+// 2. API สื่อสาร
 // ====================================================
 app.post('/api/update', async (req, res) => {
     const { userId, username, displayName, placeId, jobId, gameName, executor, status, details } = req.body;
@@ -179,6 +198,7 @@ app.post('/api/action', (req, res) => {
         } else if (action === 'rejoin') {
             pendingCommands.set(uid, 'rejoin');
         } else if (action === 'execute') {
+            // โค้ดถูกส่งมาแบบ Base64
             pendingCommands.set(uid, `execute:${code}`);
         }
         return res.json({ success: true });
@@ -200,7 +220,7 @@ app.get('/api/accounts', (req, res) => {
 });
 
 // ====================================================
-// 3. FRONTEND DASHBOARD
+// 3. FRONTEND DASHBOARD (แก้ปัญหาช่องพิมพ์โดนลบ)
 // ====================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -248,8 +268,9 @@ app.get('/', (req, res) => {
             .info-value { font-weight: 600; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
             .exec-box { margin-bottom: 16px; }
-            .exec-input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; color: white; padding: 8px; font-family: monospace; font-size: 0.78rem; resize: vertical; height: 50px; margin-bottom: 6px; }
-            .btn-exec { width: 100%; background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); padding: 6px; border-radius: 6px; font-weight: 600; font-size: 0.78rem; cursor: pointer; }
+            .exec-input { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 8px; color: #a5f3fc; padding: 10px; font-family: monospace; font-size: 0.8rem; resize: vertical; height: 70px; margin-bottom: 6px; }
+            .exec-input:focus { outline: none; border-color: var(--accent); }
+            .btn-exec { width: 100%; background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); padding: 8px; border-radius: 8px; font-weight: 600; font-size: 0.8rem; cursor: pointer; transition: all 0.2s; }
             .btn-exec:hover { background: var(--accent); color: white; }
 
             .actions-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -284,16 +305,35 @@ app.get('/', (req, res) => {
         </div>
 
         <script>
-            async function sendAction(userId, action, code = '') {
+            // แปลง Unicode เป็น Base64 ป้องกันปัญหาตัวอักษรพิเศษ/ภาษาไทย/หลายบรรทัด
+            function utf8_to_b64(str) {
+                return window.btoa(unescape(encodeURIComponent(str)));
+            }
+
+            async function sendAction(userId, action) {
                 try {
+                    let codePayload = '';
+                    if (action === 'execute') {
+                        const inputElem = document.getElementById('code-' + userId);
+                        if (!inputElem || !inputElem.value.trim()) {
+                            alert('กรุณาใส่โค้ด Luau ก่อนกดรัน');
+                            return;
+                        }
+                        codePayload = utf8_to_b64(inputElem.value);
+                    }
+
                     await fetch('/api/action', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId, action, code })
+                        body: JSON.stringify({ userId: userId, action: action, code: codePayload })
                     });
+
                     if(action === 'kick') fetchAccounts();
-                    else alert('ส่งคำสั่ง ' + action + ' เรียบร้อย!');
-                } catch(e) { alert('เกิดข้อผิดพลาด'); }
+                    else if(action === 'execute') {
+                        alert('ส่งโค้ดเรียบร้อยแล้ว!');
+                        document.getElementById('code-' + userId).value = '';
+                    } else alert('ส่งคำสั่ง ' + action + ' เรียบร้อย!');
+                } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
             }
 
             async function fetchAccounts() {
@@ -308,33 +348,52 @@ app.get('/', (req, res) => {
                         return;
                     }
 
-                    container.innerHTML = data.map(acc => \`
-                        <div class="card">
-                            <div>
-                                <div class="user-profile">
-                                    <img src="\${acc.avatarUrl}" class="avatar">
-                                    <div class="user-meta">
-                                        <h3>\${acc.displayName}</h3>
-                                        <p>@\${acc.username}</p>
+                    data.forEach(acc => {
+                        let cardElem = document.getElementById('card-' + acc.userId);
+                        if (!cardElem) {
+                            // ถ้ายังไม่มีการ์ดบัญชีนี้ ให้สร้างใหม่
+                            const newCardHtml = \`
+                            <div class="card" id="card-\${acc.userId}">
+                                <div>
+                                    <div class="user-profile">
+                                        <img src="\${acc.avatarUrl}" class="avatar">
+                                        <div class="user-meta">
+                                            <h3>\${acc.displayName}</h3>
+                                            <p>@\${acc.username}</p>
+                                        </div>
+                                    </div>
+                                    <div class="info-grid">
+                                        <div class="info-item"><span class="info-label">Map:</span><span class="info-value" id="map-\${acc.userId}" style="color:#38bdf8;">\${acc.gameName}</span></div>
+                                        <div class="info-item"><span class="info-label">Executor:</span><span class="info-value" id="exec-\${acc.userId}">\${acc.executor}</span></div>
+                                    </div>
+                                    <div class="exec-box">
+                                        <textarea id="code-\${acc.userId}" class="exec-input" placeholder="วางโค้ด Luau ที่นี่ (รองรับโค้ดยาวๆ)..."></textarea>
+                                        <button class="btn-exec" onclick="sendAction('\${acc.userId}', 'execute')">
+                                            <i class="fa-solid fa-play"></i> Run Luau Code
+                                        </button>
                                     </div>
                                 </div>
-                                <div class="info-grid">
-                                    <div class="info-item"><span class="info-label">Map:</span><span class="info-value" style="color:#38bdf8;">\${acc.gameName}</span></div>
-                                    <div class="info-item"><span class="info-label">Executor:</span><span class="info-value">\${acc.executor}</span></div>
-                                </div>
-                                <div class="exec-box">
-                                    <textarea id="code-\${acc.userId}" class="exec-input" placeholder="วางโค้ด Luau ที่ต้องการรันในจอนี้..."></textarea>
-                                    <button class="btn-exec" onclick="sendAction('\${acc.userId}', 'execute', document.getElementById('code-\${acc.userId}').value)">
-                                        <i class="fa-solid fa-play"></i> Run Luau Code
-                                    </button>
+                                <div class="actions-row">
+                                    <button class="btn-act btn-rejoin" onclick="sendAction('\${acc.userId}', 'rejoin')"><i class="fa-solid fa-rotate"></i> Rejoin</button>
+                                    <button class="btn-act btn-kick" onclick="sendAction('\${acc.userId}', 'kick')"><i class="fa-solid fa-power-off"></i> Kick</button>
                                 </div>
                             </div>
-                            <div class="actions-row">
-                                <button class="btn-act btn-rejoin" onclick="sendAction('\${acc.userId}', 'rejoin')"><i class="fa-solid fa-rotate"></i> Rejoin</button>
-                                <button class="btn-act btn-kick" onclick="sendAction('\${acc.userId}', 'kick')"><i class="fa-solid fa-power-off"></i> Kick</button>
-                            </div>
-                        </div>
-                    \`).join('');
+                            \`;
+                            container.insertAdjacentHTML('beforeend', newCardHtml);
+                        } else {
+                            // ถ้ามีการ์ดอยู่แล้ว ให้อัปเดตเฉพาะข้อความธรรมดา (ไม่แตะช่อง textarea)
+                            document.getElementById('map-' + acc.userId).innerText = acc.gameName;
+                            document.getElementById('exec-' + acc.userId).innerText = acc.executor;
+                        }
+                    });
+
+                    // ลบการ์ดของคนที่ออฟไลน์ออก
+                    const activeUids = data.map(a => String(a.userId));
+                    document.querySelectorAll('.card').forEach(card => {
+                        const uid = card.id.replace('card-', '');
+                        if (!activeUids.includes(uid)) card.remove();
+                    });
+
                 } catch(e) { console.error(e); }
             }
 
@@ -348,4 +407,3 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-            
