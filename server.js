@@ -1,11 +1,18 @@
 const express = require('express');
 const https = require('https');
+const crypto = require('crypto');
 const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
+// Database ในความจำระบบ (Database จำลอง)
+const users = new Map(); // { username: { passwordHash, secretKey } }
 const activeAccounts = new Map();
 const pendingCommands = new Map();
+
+function hashPassword(password) {
+    return crypto.createHash('sha256').update(password).digest('hex');
+}
 
 function fetchRobloxAvatar(userId) {
     return new Promise((resolve) => {
@@ -31,6 +38,7 @@ function fetchRobloxAvatar(userId) {
 app.get('/script.lua', (req, res) => {
     res.setHeader('Content-Type', 'text/plain');
     res.send(`
+local SECRET_KEY = getgenv().SecretKey or "default_user"
 local SERVER_URL = "https://loguser.onrender.com/api/update"
 local Players = game:GetService("Players")
 local TeleportService = game:GetService("TeleportService")
@@ -39,6 +47,45 @@ local MarketplaceService = game:GetService("MarketplaceService")
 local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
+local savedPosition = nil
+
+task.spawn(function()
+    while task.wait(1) do
+        pcall(function()
+            if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                savedPosition = LocalPlayer.Character.HumanoidRootPart.CFrame
+            end
+        end)
+    end
+end)
+
+local function restorePosition()
+    local joinData = LocalPlayer:GetJoinData()
+    if joinData and joinData.TeleportData and joinData.TeleportData.pos then
+        local p = joinData.TeleportData.pos
+        local targetCFrame = CFrame.new(p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12])
+        task.spawn(function()
+            local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+            local hrp = char:WaitForChild("HumanoidRootPart", 10)
+            if hrp then
+                task.wait(1.5)
+                hrp.CFrame = targetCFrame
+            end
+        end)
+    end
+end
+pcall(restorePosition)
+
+local function safeRejoin()
+    local teleportOptions = Instance.new("TeleportOptions")
+    if savedPosition then
+        local c = {savedPosition:GetComponents()}
+        teleportOptions:SetTeleportData({ pos = c })
+    end
+    pcall(function()
+        TeleportService:TeleportAsync(game.PlaceId, {LocalPlayer}, teleportOptions)
+    end)
+end
 
 local gameTitle = "Place ID: " .. tostring(game.PlaceId)
 task.spawn(function()
@@ -46,10 +93,7 @@ task.spawn(function()
         local success, result = pcall(function()
             return MarketplaceService:GetProductInfo(game.PlaceId).Name
         end)
-        if success and result and result ~= "" then
-            gameTitle = result
-            break
-        end
+        if success and result and result ~= "" then gameTitle = result; break end
         task.wait(2)
     end
 end)
@@ -77,8 +121,8 @@ local manualKicked = false
 
 local function sendStatus(statusType, details)
     if manualKicked then return end
-
     local payload = {
+        secretKey = SECRET_KEY,
         userId = LocalPlayer.UserId,
         username = LocalPlayer.Name,
         displayName = LocalPlayer.DisplayName,
@@ -89,7 +133,6 @@ local function sendStatus(statusType, details)
         status = statusType or "Online",
         details = details or "Active"
     }
-
     local requestFunc = (syn and syn.request) or (http and http.request) or request or http_request
     if requestFunc then
         pcall(function()
@@ -99,7 +142,6 @@ local function sendStatus(statusType, details)
                 Headers = {["Content-Type"] = "application/json"},
                 Body = HttpService:JSONEncode(payload)
             })
-
             if res and res.Body then
                 local resData = HttpService:JSONDecode(res.Body)
                 if resData and resData.action then
@@ -107,8 +149,7 @@ local function sendStatus(statusType, details)
                     if act == "kick" then
                         manualKicked = true
                         LocalPlayer:Kick("\\n[Web Control]\\nถูกสั่ง Disconnect จากหน้าเว็บ")
-                    elseif act == "rejoin" then
-                        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                    elseif act == "rejoin" then safeRejoin()
                     elseif string.sub(act, 1, 8) == "execute:" then
                         local encodedCode = string.sub(act, 9)
                         local success, codeToRun = pcall(function() return base64Decode(encodedCode) end)
@@ -126,38 +167,58 @@ local function sendStatus(statusType, details)
 end
 
 local isRejoining = false
-local function handleAutoRejoin(reason)
-    if isRejoining or manualKicked then return end
-    isRejoining = true
-    task.wait(2)
-    TeleportService:Teleport(game.PlaceId, LocalPlayer)
-end
-
 CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(child)
-    if child.Name == "ErrorPrompt" and not manualKicked then
-        handleAutoRejoin("Error Prompt")
+    if child.Name == "ErrorPrompt" and not manualKicked and not isRejoining then
+        isRejoining = true
+        task.wait(2)
+        safeRejoin()
     end
 end)
 
 task.spawn(function()
     while task.wait(3) do
-        if not isRejoining and not manualKicked then
-            sendStatus("Online", "Active")
-        end
+        if not isRejoining and not manualKicked then sendStatus("Online", "Active") end
     end
 end)
-
 sendStatus("Online", "Connected")
     `);
 });
 
 // ====================================================
-// 2. API ENDPOINTS
+// 2. AUTH & USER API ENDPOINTS
 // ====================================================
+app.post('/api/register', (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: 'กรุณากรอกข้อมูลให้ครบ' });
+    
+    const userLower = username.toLowerCase().trim();
+    if (users.has(userLower)) return res.status(400).json({ error: 'ชื่อผู้ใช้นี้มีอยู่ในระบบแล้ว' });
+
+    users.set(userLower, {
+        passwordHash: hashPassword(password),
+        userKey: userLower
+    });
+
+    res.json({ success: true });
+});
+
+app.post('/api/login', (req, res) => {
+    const { username, password } = req.body;
+    const userLower = (username || '').toLowerCase().trim();
+    const user = users.get(userLower);
+
+    if (!user || user.passwordHash !== hashPassword(password)) {
+        return res.status(401).json({ error: 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง' });
+    }
+
+    res.json({ success: true, userKey: user.userKey });
+});
+
 app.post('/api/update', async (req, res) => {
-    const { userId, username, displayName, placeId, jobId, gameName, executor } = req.body;
+    const { secretKey, userId, username, displayName, placeId, jobId, gameName, executor } = req.body;
     if (!userId) return res.status(400).json({ error: 'Invalid Data' });
 
+    const key = (secretKey || 'default_user').toLowerCase().trim();
     const uid = String(userId);
     let avatarUrl = activeAccounts.has(uid) ? activeAccounts.get(uid).avatarUrl : null;
     if (!avatarUrl) {
@@ -165,6 +226,7 @@ app.post('/api/update', async (req, res) => {
     }
 
     activeAccounts.set(uid, {
+        secretKey: key,
         userId: uid,
         username: username || 'Unknown',
         displayName: displayName || 'Unknown',
@@ -191,7 +253,7 @@ app.post('/api/action', (req, res) => {
         const acc = activeAccounts.get(uid);
         if (action === 'kick') {
             pendingCommands.set(uid, 'kick');
-            acc.status = 'Disconnected'; // ปรับสถานะเป็น Disconnected แทนการลบ
+            acc.status = 'Disconnected';
         } else if (action === 'rejoin') {
             pendingCommands.set(uid, 'rejoin');
         } else if (action === 'execute') {
@@ -203,22 +265,24 @@ app.post('/api/action', (req, res) => {
 });
 
 app.get('/api/accounts', (req, res) => {
+    const userKey = (req.query.key || '').toLowerCase().trim();
     const now = Date.now();
     const result = [];
     
     activeAccounts.forEach((acc) => {
-        // ถ้าไม่ได้ถูก Kick แต่หายไปเกิน 12 วินาที ให้ขึ้นว่า Not in Game
-        if (acc.status !== 'Disconnected' && (now - acc.lastSeen > 12000)) {
-            acc.status = 'Not in Game';
+        if (acc.secretKey === userKey) {
+            if (acc.status !== 'Disconnected' && (now - acc.lastSeen > 12000)) {
+                acc.status = 'Not in Game';
+            }
+            result.push(acc);
         }
-        result.push(acc);
     });
     
     res.json(result);
 });
 
 // ====================================================
-// 3. FRONTEND DASHBOARD
+// 3. FRONTEND (LOGIN & DASHBOARD UI)
 // ====================================================
 app.get('/', (req, res) => {
     res.send(`
@@ -243,14 +307,32 @@ app.get('/', (req, res) => {
                 color: var(--text-main); font-family: 'Plus Jakarta Sans', sans-serif; min-height: 100vh; padding: 32px 24px;
             }
             .container { max-width: 1320px; margin: 0 auto; }
+            
+            /* Login Box */
+            .auth-box {
+                max-width: 400px; margin: 80px auto; background: var(--card-bg); border: 1px solid var(--border);
+                border-radius: 20px; padding: 32px; backdrop-filter: blur(12px); text-align: center;
+            }
+            .auth-box h2 { font-size: 1.5rem; margin-bottom: 20px; }
+            .auth-input { width: 100%; background: rgba(0,0,0,0.4); border: 1px solid var(--border); border-radius: 10px; padding: 12px; color: white; margin-bottom: 14px; outline: none; }
+            .auth-input:focus { border-color: var(--accent); }
+            .auth-btn { width: 100%; background: var(--accent); color: white; border: none; padding: 12px; border-radius: 10px; font-weight: 700; cursor: pointer; margin-bottom: 10px; }
+            .auth-btn-sub { background: transparent; border: 1px solid var(--border); color: var(--text-sub); }
+            
+            /* Dashboard UI */
             .header-panel {
                 background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border);
-                border-radius: 20px; padding: 20px 28px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px;
+                border-radius: 20px; padding: 20px 28px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;
             }
             .brand { display: flex; align-items: center; gap: 14px; }
             .brand-icon { width: 46px; height: 46px; background: linear-gradient(135deg, var(--accent), #4f46e5); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; color: white; }
-            .stats-badge { display: flex; align-items: center; gap: 10px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); padding: 8px 16px; border-radius: 30px; color: var(--success); font-weight: 700; font-size: 0.85rem; }
-            
+            .user-tag { background: rgba(99, 102, 241, 0.15); border: 1px solid rgba(99, 102, 241, 0.3); color: #818cf8; padding: 6px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 700; }
+            .logout-btn { background: rgba(244, 63, 94, 0.15); color: var(--danger); border: 1px solid rgba(244, 63, 94, 0.3); padding: 6px 14px; border-radius: 20px; cursor: pointer; font-weight: 700; font-size: 0.82rem; margin-left: 10px; }
+
+            .script-guide {
+                background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 14px; padding: 14px 20px; margin-bottom: 24px; color: #34d399; font-size: 0.85rem; font-weight: 600; display: flex; justify-content: space-between; align-items: center;
+            }
+
             .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 24px; }
             .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border); border-radius: 20px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; position: relative; overflow: hidden; }
             .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, var(--accent), var(--success)); }
@@ -261,8 +343,7 @@ app.get('/', (req, res) => {
             .user-meta h3 { font-size: 1.05rem; font-weight: 700; }
             .user-meta p { font-size: 0.8rem; color: var(--text-sub); }
 
-            /* Status Badge Style */
-            .status-tag { padding: 4px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+            .status-tag { padding: 4px 10px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }
             .status-tag.active { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
             .status-tag.disconnected { background: rgba(244, 63, 94, 0.15); color: #f87171; border: 1px solid rgba(244, 63, 94, 0.3); }
             .status-tag.notingame { background: rgba(148, 163, 184, 0.15); color: #94a3b8; border: 1px solid rgba(148, 163, 184, 0.3); }
@@ -289,7 +370,17 @@ app.get('/', (req, res) => {
         </style>
     </head>
     <body>
-        <div class="container">
+        <!-- หน้าเข้าสู่ระบบ / สมัครสมาชิก -->
+        <div id="authPanel" class="auth-box">
+            <h2 id="authTitle"><i class="fa-solid fa-user-shield" style="color: var(--accent);"></i> เข้าสู่ระบบ</h2>
+            <input type="text" id="username" class="auth-input" placeholder="ชื่อผู้ใช้ (Username)">
+            <input type="password" id="password" class="auth-input" placeholder="รหัสผ่าน (Password)">
+            <button class="auth-btn" onclick="handleAuth()"><span id="authBtnText">เข้าสู่ระบบ</span></button>
+            <button class="auth-btn auth-btn-sub" onclick="toggleAuthMode()"><span id="subBtnText">ยังไม่มีบัญชี? สมัครสมาชิก</span></button>
+        </div>
+
+        <!-- หน้า Dashboard หลัก -->
+        <div id="dashPanel" class="container" style="display: none;">
             <div class="header-panel">
                 <div class="brand">
                     <div class="brand-icon"><i class="fa-solid fa-cubes"></i></div>
@@ -298,20 +389,80 @@ app.get('/', (req, res) => {
                         <p style="font-size: 0.8rem; color: var(--text-sub);">Remote Command Center</p>
                     </div>
                 </div>
-                <div class="stats-badge">
-                    <i class="fa-solid fa-signal"></i>
-                    <span id="accountCount">0 Accounts</span>
+                <div>
+                    <span class="user-tag"><i class="fa-solid fa-user"></i> <span id="currentUserName">User</span></span>
+                    <button class="logout-btn" onclick="logout()"><i class="fa-solid fa-right-from-bracket"></i> ออกจากระบบ</button>
                 </div>
+            </div>
+
+            <div class="script-guide">
+                <span><i class="fa-solid fa-code"></i> โค้ดสำหรับวางใน Executor บนมือถือของคุณ:</span>
+                <code id="luaScriptCode" style="background: rgba(0,0,0,0.4); padding: 4px 10px; border-radius: 6px; font-family: monospace;">getgenv().SecretKey = "..." ; loadstring(...)()</code>
             </div>
 
             <div class="grid" id="accountGrid">
                 <div class="empty-state" id="emptyState">
-                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีข้อมูลตัวละครในระบบ
+                    <i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครกำลังออนไลน์ในบัญชีนี้
                 </div>
             </div>
         </div>
 
         <script>
+            let isRegisterMode = false;
+            let loggedInUserKey = localStorage.getItem('app_user_key');
+
+            function toggleAuthMode() {
+                isRegisterMode = !isRegisterMode;
+                document.getElementById('authTitle').innerHTML = isRegisterMode ? '<i class="fa-solid fa-user-plus" style="color: var(--accent);"></i> สมัครสมาชิก' : '<i class="fa-solid fa-user-shield" style="color: var(--accent);"></i> เข้าสู่ระบบ';
+                document.getElementById('authBtnText').innerText = isRegisterMode ? 'สมัครสมาชิก' : 'เข้าสู่ระบบ';
+                document.getElementById('subBtnText').innerText = isRegisterMode ? 'มีบัญชีอยู่แล้ว? เข้าสู่ระบบ' : 'ยังไม่มีบัญชี? สมัครสมาชิก';
+            }
+
+            async function handleAuth() {
+                const u = document.getElementById('username').value.trim();
+                const p = document.getElementById('password').value.trim();
+                if(!u || !p) return alert('กรุณากรอก Username และ Password');
+
+                const endpoint = isRegisterMode ? '/api/register' : '/api/login';
+                try {
+                    const res = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ username: u, password: p })
+                    });
+                    const data = await res.json();
+                    if(!res.ok) return alert(data.error || 'เกิดข้อผิดพลาด');
+
+                    if(isRegisterMode) {
+                        alert('สมัครสมาชิกสำเร็จ! กรุณาเข้าสู่ระบบ');
+                        toggleAuthMode();
+                    } else {
+                        loggedInUserKey = data.userKey;
+                        localStorage.setItem('app_user_key', loggedInUserKey);
+                        checkLoginState();
+                    }
+                } catch(e) { alert('ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ได้'); }
+            }
+
+            function logout() {
+                localStorage.removeItem('app_user_key');
+                loggedInUserKey = null;
+                checkLoginState();
+            }
+
+            function checkLoginState() {
+                if(loggedInUserKey) {
+                    document.getElementById('authPanel').style.display = 'none';
+                    document.getElementById('dashPanel').style.display = 'block';
+                    document.getElementById('currentUserName').innerText = loggedInUserKey;
+                    document.getElementById('luaScriptCode').innerText = \`getgenv().SecretKey = "\${loggedInUserKey}"\\nloadstring(game:HttpGet("https://loguser.onrender.com/script.lua"))()\`;
+                    fetchAccounts();
+                } else {
+                    document.getElementById('authPanel').style.display = 'block';
+                    document.getElementById('dashPanel').style.display = 'none';
+                }
+            }
+
             function encodeBase64Safe(str) {
                 return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, function(match, p1) {
                     return String.fromCharCode('0x' + p1);
@@ -323,10 +474,7 @@ app.get('/', (req, res) => {
                     let codePayload = '';
                     if (action === 'execute') {
                         const inputElem = document.getElementById('code-' + userId);
-                        if (!inputElem || !inputElem.value.trim()) {
-                            alert('กรุณาใส่โค้ด Luau ก่อนกดรัน');
-                            return;
-                        }
+                        if (!inputElem || !inputElem.value.trim()) return alert('กรุณาใส่โค้ด Luau ก่อนกดรัน');
                         codePayload = encodeBase64Safe(inputElem.value);
                     }
 
@@ -340,7 +488,7 @@ app.get('/', (req, res) => {
                     else if(action === 'execute') {
                         alert('ส่งโค้ดเรียบร้อยแล้ว!');
                         document.getElementById('code-' + userId).value = '';
-                    } else alert('ส่งคำสั่ง ' + action + ' เรียบร้อย!');
+                    } else alert('ส่งคำสั่งเรียบร้อย!');
                 } catch(e) { alert('เกิดข้อผิดพลาดในการส่งคำสั่ง'); }
             }
 
@@ -351,14 +499,12 @@ app.get('/', (req, res) => {
             }
 
             async function fetchAccounts() {
+                if(!loggedInUserKey) return;
                 try {
-                    const res = await fetch('/api/accounts');
+                    const res = await fetch('/api/accounts?key=' + encodeURIComponent(loggedInUserKey));
                     const data = await res.json();
                     const container = document.getElementById('accountGrid');
                     const emptyState = document.getElementById('emptyState');
-                    
-                    const activeCount = data.filter(a => a.status === 'Active').length;
-                    document.getElementById('accountCount').innerText = \`\${activeCount} Active / \${data.length} Total\`;
                     
                     if(data.length === 0) {
                         if(emptyState) emptyState.style.display = 'block';
@@ -403,18 +549,16 @@ app.get('/', (req, res) => {
                             \`;
                             container.insertAdjacentHTML('beforeend', newCardHtml);
                         } else {
-                            // อัปเดตข้อมูลและสถานะของการ์ดแบบสดๆ โดยไม่ลบการ์ด
                             document.getElementById('map-' + acc.userId).innerText = acc.gameName;
                             document.getElementById('exec-' + acc.userId).innerText = acc.executor;
                             document.getElementById('status-' + acc.userId).innerHTML = getStatusBadge(acc.status);
                         }
                     });
-
                 } catch(e) { console.error(e); }
             }
 
             setInterval(fetchAccounts, 2500);
-            fetchAccounts();
+            checkLoginState();
         </script>
     </body>
     </html>
