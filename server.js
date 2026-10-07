@@ -5,9 +5,9 @@ const app = express();
 app.use(express.json());
 
 const activeAccounts = new Map();
-const pendingCommands = new Map();
+const pendingCommands = new Map(); // เก็บคำสั่ง เช่น "kick", "rejoin", หรือ "execute:<code_base64>"
 
-// Helper สำหรับเรียก Roblox API ฝั่ง Node.js (หลีกเลี่ยง CORS บน Browser)
+// Helper ดึงรูป Avatar
 function fetchRobloxAvatar(userId) {
     return new Promise((resolve) => {
         const url = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png&isCircular=false`;
@@ -19,24 +19,130 @@ function fetchRobloxAvatar(userId) {
                     const parsed = JSON.parse(data);
                     if (parsed.data && parsed.data[0] && parsed.data[0].imageUrl) {
                         resolve(parsed.data[0].imageUrl);
-                    } else {
-                        resolve(null);
-                    }
+                    } else { resolve(null); }
                 } catch { resolve(null); }
             });
         }).on('error', () => resolve(null));
     });
 }
 
-// 1. API รับข้อมูลจาก Executor
+// ====================================================
+// 1. ENDPOINT สำหรับ LOADSTRING (แจกโค้ด Luau ล่าสุด)
+// ====================================================
+app.get('/script.lua', (req, res) => {
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(`
+local SERVER_URL = "https://loguser.onrender.com/api/update"
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local gameTitle = "Place ID: " .. tostring(game.PlaceId)
+task.spawn(function()
+    for i = 1, 5 do
+        local success, result = pcall(function()
+            return MarketplaceService:GetProductInfo(game.PlaceId).Name
+        end)
+        if success and result and result ~= "" then
+            gameTitle = result
+            break
+        end
+        task.wait(2)
+    end
+end)
+
+local function getExecutorName()
+    return (identifyexecutor and identifyexecutor()) or (getexecutorname and getexecutorname()) or "Unknown Executor"
+end
+
+local manualKicked = false
+
+local function sendStatus(statusType, details)
+    if manualKicked then return end
+
+    local payload = {
+        userId = LocalPlayer.UserId,
+        username = LocalPlayer.Name,
+        displayName = LocalPlayer.DisplayName,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        gameName = gameTitle,
+        executor = getExecutorName(),
+        status = statusType or "Online",
+        details = details or "Active"
+    }
+
+    local requestFunc = (syn and syn.request) or (http and http.request) or request or http_request
+    if requestFunc then
+        pcall(function()
+            local res = requestFunc({
+                Url = SERVER_URL,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = HttpService:JSONEncode(payload)
+            })
+
+            if res and res.Body then
+                local resData = HttpService:JSONDecode(res.Body)
+                if resData and resData.action then
+                    local act = resData.action
+                    if act == "kick" then
+                        manualKicked = true
+                        LocalPlayer:Kick("\\n[Web Control]\\nถูกสั่ง Disconnect จากหน้าเว็บ")
+                    elseif act == "rejoin" then
+                        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+                    elseif string.sub(act, 1, 8) == "execute:" then
+                        local codeToRun = string.sub(act, 9)
+                        task.spawn(function()
+                            local func, err = loadstring(codeToRun)
+                            if func then func() else warn("Exec Error: " .. tostring(err)) end
+                        end)
+                    end
+                end
+            end
+        end)
+    end
+end
+
+-- Auto Rejoin ระบบหลุดปกติ
+local isRejoining = false
+local function handleAutoRejoin(reason)
+    if isRejoining or manualKicked then return end
+    isRejoining = true
+    task.wait(2)
+    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+end
+
+CoreGui.RobloxPromptGui.promptOverlay.ChildAdded:Connect(function(child)
+    if child.Name == "ErrorPrompt" and not manualKicked then
+        handleAutoRejoin("Error Prompt")
+    end
+end)
+
+task.spawn(function()
+    while task.wait(3) do
+        if not isRejoining and not manualKicked then
+            sendStatus("Online", "Active")
+        end
+    end
+end)
+
+sendStatus("Online", "Connected")
+    `);
+});
+
+// ====================================================
+// 2. API สื่อสารกับ EXECUTOR & DASHBOARD
+// ====================================================
 app.post('/api/update', async (req, res) => {
     const { userId, username, displayName, placeId, jobId, gameName, executor, status, details } = req.body;
-    
     if (!userId) return res.status(400).json({ error: 'Invalid Data' });
 
     const uid = String(userId);
-
-    // ดึงรูป Avatar ผ่าน Server
     let avatarUrl = activeAccounts.has(uid) ? activeAccounts.get(uid).avatarUrl : null;
     if (!avatarUrl) {
         avatarUrl = await fetchRobloxAvatar(uid);
@@ -57,48 +163,45 @@ app.post('/api/update', async (req, res) => {
     });
 
     const commandToExecute = pendingCommands.get(uid) || null;
-    if (commandToExecute) {
-        pendingCommands.delete(uid);
-    }
+    if (commandToExecute) pendingCommands.delete(uid);
 
-    res.json({
-        success: true,
-        action: commandToExecute
-    });
+    res.json({ success: true, action: commandToExecute });
 });
 
-// 2. API สั่ง Kick และลบบัญชีออกจากการ์ด
-app.post('/api/kick', (req, res) => {
-    const { userId } = req.body;
+app.post('/api/action', (req, res) => {
+    const { userId, action, code } = req.body;
     const uid = String(userId);
 
     if (activeAccounts.has(uid)) {
-        pendingCommands.set(uid, 'kick');
-        // ลบข้อมูลออกจาก List ทันทีเมื่อผู้ใช้สั่งเตะการ์ดนั้น
-        activeAccounts.delete(uid);
-        return res.json({ success: true, message: 'ส่งคำสั่ง Kick และลบการ์ดเรียบร้อย' });
+        if (action === 'kick') {
+            pendingCommands.set(uid, 'kick');
+            activeAccounts.delete(uid);
+        } else if (action === 'rejoin') {
+            pendingCommands.set(uid, 'rejoin');
+        } else if (action === 'execute') {
+            pendingCommands.set(uid, `execute:${code}`);
+        }
+        return res.json({ success: true });
     }
-    res.status(404).json({ error: 'ไม่พบบัญชีนี้' });
+    res.status(404).json({ error: 'User not found' });
 });
 
-// 3. API ดึงรายชื่อบัญชี
 app.get('/api/accounts', (req, res) => {
     const now = Date.now();
     const result = [];
-
     activeAccounts.forEach((acc, uid) => {
-        // ถ้าไม่ส่งข้อมูลเกิน 12 วินาที ให้ตัดออกจากหน้าเว็บ
         if (now - acc.lastSeen > 12000) {
             activeAccounts.delete(uid);
         } else {
             result.push(acc);
         }
     });
-
     res.json(result);
 });
 
-// 4. หน้าเว็บ UI
+// ====================================================
+// 3. FRONTEND DASHBOARD
+// ====================================================
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
@@ -106,45 +209,91 @@ app.get('/', (req, res) => {
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Roblox Tracker & Control</title>
-        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+        <title>Roblox Control Center</title>
+        <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
         <style>
             :root {
-                --bg: #0b0f19; --card: #151c2c; --border: #232d42;
-                --text: #f8fafc; --sub: #94a3b8; --success: #10b981;
-                --danger: #ef4444; --accent: #6366f1;
+                --bg: #07090e; --card-bg: rgba(15, 23, 42, 0.75); --border: rgba(255, 255, 255, 0.08);
+                --text-main: #f8fafc; --text-sub: #64748b; --accent: #6366f1; --success: #10b981;
+                --warning: #f59e0b; --danger: #f43f5e;
             }
-            body { background: var(--bg); color: var(--text); font-family: 'Plus Jakarta Sans', sans-serif; margin: 0; padding: 24px; }
-            .header { max-width: 1200px; margin: 0 auto 30px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
-            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; max-width: 1200px; margin: 0 auto; }
-            .card { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 20px; box-shadow: 0 10px 20px rgba(0,0,0,0.3); }
-            .user-info { display: flex; align-items: center; gap: 15px; margin-bottom: 15px; }
-            .avatar { width: 55px; height: 55px; border-radius: 50%; border: 2px solid var(--border); background: #0f172a; object-fit: cover; }
-            .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: bold; background: rgba(16,185,129,0.15); color: var(--success); }
-            .details { background: rgba(0,0,0,0.25); padding: 12px; border-radius: 10px; font-size: 0.85rem; line-height: 1.6; margin-bottom: 15px; }
-            .btn-kick { width: 100%; background: linear-gradient(135deg, #ef4444, #dc2626); color: white; border: none; padding: 10px; border-radius: 8px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; transition: transform 0.1s; }
-            .btn-kick:active { transform: scale(0.98); }
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                background-color: var(--bg);
+                background-image: radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.12) 0px, transparent 50%);
+                color: var(--text-main); font-family: 'Plus Jakarta Sans', sans-serif; min-height: 100vh; padding: 32px 24px;
+            }
+            .container { max-width: 1320px; margin: 0 auto; }
+            .header-panel {
+                background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border);
+                border-radius: 20px; padding: 20px 28px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px;
+            }
+            .brand { display: flex; align-items: center; gap: 14px; }
+            .brand-icon { width: 46px; height: 46px; background: linear-gradient(135deg, var(--accent), #4f46e5); border-radius: 12px; display: flex; align-items: center; justify-content: center; font-size: 1.3rem; color: white; }
+            .stats-badge { display: flex; align-items: center; gap: 10px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.2); padding: 8px 16px; border-radius: 30px; color: var(--success); font-weight: 700; font-size: 0.85rem; }
+            
+            .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 24px; }
+            .card { background: var(--card-bg); backdrop-filter: blur(12px); border: 1px solid var(--border); border-radius: 20px; padding: 22px; display: flex; flex-direction: column; justify-content: space-between; position: relative; overflow: hidden; }
+            .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: linear-gradient(90deg, var(--accent), var(--success)); }
+            
+            .user-profile { display: flex; align-items: center; gap: 16px; margin-bottom: 16px; }
+            .avatar { width: 58px; height: 58px; border-radius: 16px; object-fit: cover; border: 2px solid var(--border); background: #020617; }
+            .user-meta h3 { font-size: 1.05rem; font-weight: 700; }
+            .user-meta p { font-size: 0.8rem; color: var(--text-sub); }
+
+            .info-grid { background: rgba(2, 6, 23, 0.5); border: 1px solid var(--border); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 8px; font-size: 0.82rem; margin-bottom: 16px; }
+            .info-item { display: flex; justify-content: space-between; }
+            .info-label { color: var(--text-sub); }
+            .info-value { font-weight: 600; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+            .exec-box { margin-bottom: 16px; }
+            .exec-input { width: 100%; background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px; color: white; padding: 8px; font-family: monospace; font-size: 0.78rem; resize: vertical; height: 50px; margin-bottom: 6px; }
+            .btn-exec { width: 100%; background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); padding: 6px; border-radius: 6px; font-weight: 600; font-size: 0.78rem; cursor: pointer; }
+            .btn-exec:hover { background: var(--accent); color: white; }
+
+            .actions-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+            .btn-act { padding: 10px; border-radius: 10px; font-weight: 700; font-size: 0.82rem; cursor: pointer; border: none; display: flex; align-items: center; justify-content: center; gap: 6px; }
+            .btn-rejoin { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+            .btn-rejoin:hover { background: var(--warning); color: white; }
+            .btn-kick { background: rgba(244, 63, 94, 0.15); color: var(--danger); border: 1px solid rgba(244, 63, 94, 0.3); }
+            .btn-kick:hover { background: var(--danger); color: white; }
+
+            .empty-state { grid-column: 1 / -1; text-align: center; padding: 60px 20px; background: var(--card-bg); border-radius: 20px; border: 1px solid var(--border); color: var(--text-sub); }
         </style>
     </head>
     <body>
-        <div class="header">
-            <h2><i class="fa-solid fa-shield-halved" style="color: var(--accent);"></i> Roblox Live Tracker</h2>
-            <span style="color: var(--sub); font-size: 0.85rem;"><i class="fa-solid fa-rotate fa-spin"></i> Realtime Auto-Sync</span>
+        <div class="container">
+            <div class="header-panel">
+                <div class="brand">
+                    <div class="brand-icon"><i class="fa-solid fa-cubes"></i></div>
+                    <div>
+                        <h1 style="font-size: 1.25rem;">Roblox Control Hub</h1>
+                        <p style="font-size: 0.8rem; color: var(--text-sub);">Remote Command Center</p>
+                    </div>
+                </div>
+                <div class="stats-badge">
+                    <i class="fa-solid fa-signal"></i>
+                    <span id="accountCount">0 Active</span>
+                </div>
+            </div>
+
+            <div class="grid" id="accountGrid">
+                <div class="empty-state">กำลังเชื่อมต่อ...</div>
+            </div>
         </div>
-        <div class="grid" id="accountGrid">กำลังโหลดข้อมูล...</div>
 
         <script>
-            async function kickAccount(userId) {
-                if(!confirm("สั่งเตะตัวละครนี้ออกจากเกม และลบการ์ดออกใช่หรือไม่?")) return;
+            async function sendAction(userId, action, code = '') {
                 try {
-                    await fetch('/api/kick', {
+                    await fetch('/api/action', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId: userId })
+                        body: JSON.stringify({ userId, action, code })
                     });
-                    fetchAccounts();
-                } catch(e) { alert("เกิดข้อผิดพลาด"); }
+                    if(action === 'kick') fetchAccounts();
+                    else alert('ส่งคำสั่ง ' + action + ' เรียบร้อย!');
+                } catch(e) { alert('เกิดข้อผิดพลาด'); }
             }
 
             async function fetchAccounts() {
@@ -152,35 +301,40 @@ app.get('/', (req, res) => {
                     const res = await fetch('/api/accounts');
                     const data = await res.json();
                     const container = document.getElementById('accountGrid');
+                    document.getElementById('accountCount').innerText = \`\${data.length} Active\`;
                     
                     if(data.length === 0) {
-                        container.innerHTML = '<p style="color: var(--sub); grid-column: 1/-1; text-align: center;">ไม่มีบัญชีที่กำลังออนไลน์ในขณะนี้</p>';
+                        container.innerHTML = \`<div class="empty-state"><i class="fa-solid fa-ghost fa-2x"></i><br><br>ไม่มีตัวละครออนไลน์อยู่</div>\`;
                         return;
                     }
 
-                    container.innerHTML = data.map(acc => {
-                        return \`
+                    container.innerHTML = data.map(acc => \`
                         <div class="card">
-                            <div class="user-info">
-                                <img src="\${acc.avatarUrl}" class="avatar" alt="Avatar" onerror="this.src='https://tr.rbxcdn.com/30day-avatar-headshot'">
-                                <div>
-                                    <h3 style="margin:0; font-size: 1.1rem;">\${acc.displayName}</h3>
-                                    <p style="margin:2px 0 6px 0; color:var(--sub); font-size:0.8rem;">@\${acc.username} (\${acc.userId})</p>
-                                    <span class="badge">\${acc.status}</span>
+                            <div>
+                                <div class="user-profile">
+                                    <img src="\${acc.avatarUrl}" class="avatar">
+                                    <div class="user-meta">
+                                        <h3>\${acc.displayName}</h3>
+                                        <p>@\${acc.username}</p>
+                                    </div>
+                                </div>
+                                <div class="info-grid">
+                                    <div class="info-item"><span class="info-label">Map:</span><span class="info-value" style="color:#38bdf8;">\${acc.gameName}</span></div>
+                                    <div class="info-item"><span class="info-label">Executor:</span><span class="info-value">\${acc.executor}</span></div>
+                                </div>
+                                <div class="exec-box">
+                                    <textarea id="code-\${acc.userId}" class="exec-input" placeholder="วางโค้ด Luau ที่ต้องการรันในจอนี้..."></textarea>
+                                    <button class="btn-exec" onclick="sendAction('\${acc.userId}', 'execute', document.getElementById('code-\${acc.userId}').value)">
+                                        <i class="fa-solid fa-play"></i> Run Luau Code
+                                    </button>
                                 </div>
                             </div>
-                            <div class="details">
-                                <div><b><i class="fa-solid fa-map-location-dot"></i> แมพ:</b> <span style="color:#38bdf8;">\${acc.gameName}</span></div>
-                                <div><b><i class="fa-solid fa-terminal"></i> Executor:</b> \${acc.executor}</div>
-                                <div><b><i class="fa-solid fa-server"></i> Job ID:</b> <span style="font-family:monospace;">\${acc.jobId.slice(0,10)}...</span></div>
-                                <div><b><i class="fa-solid fa-circle-info"></i> สถานะ:</b> \${acc.details}</div>
+                            <div class="actions-row">
+                                <button class="btn-act btn-rejoin" onclick="sendAction('\${acc.userId}', 'rejoin')"><i class="fa-solid fa-rotate"></i> Rejoin</button>
+                                <button class="btn-act btn-kick" onclick="sendAction('\${acc.userId}', 'kick')"><i class="fa-solid fa-power-off"></i> Kick</button>
                             </div>
-                            <button class="btn-kick" onclick="kickAccount('\${acc.userId}')">
-                                <i class="fa-solid fa-power-off"></i> สั่ง Disconnect (Kick)
-                            </button>
                         </div>
-                        \`;
-                    }).join('');
+                    \`).join('');
                 } catch(e) { console.error(e); }
             }
 
@@ -194,3 +348,4 @@ app.get('/', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+            
